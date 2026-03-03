@@ -7,6 +7,22 @@ DEFAULT_VOC = 10
 DEFAULT_WINDOW = 8
 DEFAULT_LAYER = 3
 DEFAULT_HEAD = 2
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim=DEFAULT_DIM):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+        self.eps = 1e-5
+        
+    def forward(self, x):
+        std = torch.std(x, dim=-1, keepdim=True)
+        mean = torch.mean(x, dim=-1,keepdim=True)
+        x = (x-mean)/(std+self.eps)
+        x = x*self.gamma + self.beta
+        return x
+        
 class Embedding(nn.Module):
     def __init__(self, dim=DEFAULT_DIM, voc=DEFAULT_VOC):
         super().__init__()
@@ -38,7 +54,16 @@ class MHAttention(nn.Module):
         v = v.view(b,s,self.head,-1).permute(0,2,1,3)
         # attention score, it should still feel like bsh except we added a new dim
         qk = q@k.transpose(-2,-1)/math.sqrt(d) # d is smaller than dim
+        
+        r = torch.arange(s).unsqueeze(1) # s,1 [0,0,0],[1,1,1],[2,2,2]
+        print("r", r.shape, r)
+        c = torch.arange(s).unsqueeze(0) # 1,s [0,1,2],[0,1,2],[0,1,2]
+        print("c", c.shape, c)
+        mask = r < c
+        print("mask", mask)
+        qk = qk.masked_fill(mask, float('-inf'))
         qk = nn.functional.softmax(qk, dim=-1)
+        print("qk after softmax mha", qk)
         qkv = (qk@v).permute(0,2,1,3).reshape(b,s,-1) # swich back to bshd and then bsh
         return self.out(qkv)
         
@@ -51,10 +76,24 @@ class Attention(nn.Module):
         self.out=nn.Linear(self.dim, self.dim)
     
     def forward(self, x): # bsh -> bsh
-        q,k, v = self.kqv(x).chunk(3, dim=-1) # b*s*3h -> bsh, bsh, bsh
+        b,s,h = x.shape
+        q,k,v = self.kqv(x).chunk(3, dim=-1) # b*s*3h -> bsh, bsh, bsh
         print("q", q.shape, q[1])
         # qk will be significant larger than q, so we have to divid by dim (sqrt)
         qk = q@k.transpose(-2,-1)/math.sqrt(self.dim) # bsh @ bhs -> bss
+        # add causal masks
+        '''
+        [1,2,3]     [1,-inf,-inf]
+        [2,3,4]  -> [2,3,-inf]
+        [3,3,4]     [3,3,3]
+        '''
+        r = torch.arange(s).unsqueeze(1) # s,1 [0,0,0],[1,1,1],[2,2,2]
+        print("r", r.shape, r)
+        c = torch.arange(s).unsqueeze(0) # 1,s [0,1,2],[0,1,2],[0,1,2]
+        print("c", c.shape, c)
+        mask = r < c
+        print("mask", mask)
+        qk = qk.masked_fill(mask, float('-inf'))
         print("qk", qk)
         # do softmax (sum of each row is one)
         qk = nn.functional.softmax(qk, dim=-1)
@@ -71,6 +110,7 @@ class MLP(nn.Module):
     
     def forward(self, x):# bsh
         x = self.mlp1(x)
+        x = nn.functional.gelu(x)
         x = self.mlp2(x)
         return x
 
@@ -79,14 +119,19 @@ class AttentionBlock(nn.Module):
         super().__init__()
         self.att = att
         self.mlp = mlp
-    
+        self.layer_norm = LayerNorm()
+        self.layer_norm2 = LayerNorm()
     def forward(self, x):
-        x = self.att(x)
-        return self.mlp(x)
-
+        
+        x = x + self.att(self.layer_norm(x))
+        x = x + self.mlp(self.layer_norm2(x))
+        return x
+        
 class Transformer(nn.Module):
     def __init__(self, dim=DEFAULT_DIM, voc=DEFAULT_VOC, window=DEFAULT_WINDOW, num_layer=DEFAULT_LAYER):
         super().__init__()
+        self.window = window
+        self.pos_emb = nn.Embedding(window, dim)
         self.embedding = Embedding()
         self.attention = nn.Sequential()
         self.lm_head = nn.Linear(dim, voc)
@@ -98,7 +143,14 @@ class Transformer(nn.Module):
     
     
     def forward(self, x):
-        x = self.embedding(x) # BS -> BSH
+        b,s = x.shape
+        assert s <= self.window
+        emb = self.embedding(x) # BS -> BSH
+        pos_idx = torch.arange(s) # s
+        pos_emb = self.pos_emb(pos_idx) #(sh)
+        print("pos_emb", pos_emb.shape)
+        x = emb + pos_emb #bsh, broadcast
+        print("x shape after pos emb", x.shape)
         # BSH->BSH
         for att in self.attention:
             x = att(x) 
@@ -110,16 +162,17 @@ class Transformer(nn.Module):
 if __name__ == '__main__':
     data = torch.randint(0, 10, (2, 3))
     print("data", data)
-    # transformer = Transformer()
-    # x = transformer(data)
+    transformer = Transformer()
+    x = transformer(data)
+    print("x", x)
+    # table = Embedding()
+    # print("table", table.table.weight.shape, table.table.weight)
+    # embedding = table(data)   
+    # print("embedding", embedding.shape, embedding) 
+    # 
+    # attention = MHAttention()
+    # x = attention(embedding)
     # print("x", x)
-    table = Embedding()
-    print("table", table.table.weight.shape, table.table.weight)
-    embedding = table(data)   
-    print("embedding", embedding.shape, embedding) 
-    
-    attention = MHAttention()
-    x = attention(embedding)
     # 
     # mlp = MLP()
     # m = mlp(x)
